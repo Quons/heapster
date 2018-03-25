@@ -31,6 +31,7 @@ import (
 	"k8s.io/heapster/metrics/sinks/librato"
 	logsink "k8s.io/heapster/metrics/sinks/log"
 	metricsink "k8s.io/heapster/metrics/sinks/metric"
+	"k8s.io/heapster/metrics/sinks/openfalcon"
 	"k8s.io/heapster/metrics/sinks/opentsdb"
 	"k8s.io/heapster/metrics/sinks/riemann"
 	"k8s.io/heapster/metrics/sinks/stackdriver"
@@ -62,6 +63,7 @@ func (this *SinkFactory) Build(uri flags.Uri) (core.DataSink, error) {
 	case "librato":
 		return librato.CreateLibratoSink(&uri.Val)
 	case "log":
+		glog.Infof("log start")
 		return logsink.NewLogSink(), nil
 	case "metric":
 		return metricsink.NewMetricSink(140*time.Second, 15*time.Minute, []string{
@@ -75,6 +77,9 @@ func (this *SinkFactory) Build(uri flags.Uri) (core.DataSink, error) {
 		return riemann.CreateRiemannSink(&uri.Val)
 	case "honeycomb":
 		return honeycomb.NewHoneycombSink(&uri.Val)
+	case "openfalcon":
+		glog.Infof("openfalconSink start")
+		return openfalcon.CreateFalconSink(&uri.Val)
 	default:
 		return nil, fmt.Errorf("Sink not recognized: %s", uri.Key)
 	}
