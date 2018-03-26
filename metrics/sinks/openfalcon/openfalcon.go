@@ -1,11 +1,13 @@
 package openfalcon
 
 import (
+	"bytes"
 	"encoding/json"
 	"github.com/golang/glog"
+	"io/ioutil"
 	"k8s.io/heapster/metrics/core"
+	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 )
@@ -16,7 +18,7 @@ type openfalconSink struct {
 	host string
 	// wg and conChan will work together to limit concurrent influxDB sink goroutines.
 	wg sync.WaitGroup
-	//使用到了空结构体最为chan存储类型
+	//使用到了空结构体作为chan存储类型
 	conChan chan struct{}
 }
 
@@ -41,29 +43,38 @@ func (sink *openfalconSink) Name() string {
 
 func (sink *openfalconSink) ExportData(dataBatch *core.DataBatch) {
 	glog.Infof("start export data")
+	dbJson, err := json.Marshal(dataBatch)
+	if err != nil {
+		glog.Infof("dataBatch to json err:%s", err)
+		return
+	}
+	glog.V(2).Infof("dataBatch json:%s", dbJson)
 	sink.Lock()
 	defer sink.Unlock()
-
 	var endpoint string
 	fts := make([]falconType, 0, 0)
-	glog.Infof("dataBatch %v", dataBatch.MetricSets)
 	for _, metricSet := range dataBatch.MetricSets {
-		//遍历metricSet.label 获取endpoint信息
-		for labelName, labelValue := range metricSet.Labels {
-			//获取nodename 或者hostname
-			glog.V(4).Infof("labelName:%s  labeVlue: %s", labelName, labelValue)
-			if strings.EqualFold(labelName, "nodename") {
-				endpoint = labelValue
-			}
-			//metricSet.Labels key:nodename   value:k8s-node-1
-			//metricSet.Labels key:hostname   value:k8s-node-1
-			//metricSet.Labels key:host_id   value:k8s-node-1
-			//metricSet.Labels key:type   value:sys_container
-			//metricSet.Labels key:container_name   value:system.slice/chronyd.service
+		//这里可以添加过滤
+		labelType := metricSet.Labels["type"]
+		switch labelType {
+		case "sys_container":
+			endpoint = metricSet.Labels["container_name"]
+		case "node":
+			endpoint = metricSet.Labels["nodename"]
+		case "cluster":
+			endpoint = "k8s-cluster"
+		case "ns":
+			endpoint = metricSet.Labels["namespace_name"]
+		case "pod":
+			endpoint = metricSet.Labels["pod_name"]
+		case "pod_container":
+			endpoint = metricSet.Labels["pod_name"]
+		default:
+			endpoint = "another_type"
+			defaultJson, _ := json.Marshal(metricSet.Labels)
+			glog.V(3).Infof("another type :%s", string(defaultJson[:]))
 		}
-		glog.V(4).Infof("metricvalues: %v", metricSet.MetricValues)
 		for metricName, metricValue := range metricSet.MetricValues {
-			glog.V(4).Infof("metricName:%s  metricValue:%s", metricName, metricValue)
 			//转换数据类型，都变成float64
 			var value float64
 			if core.ValueInt64 == metricValue.ValueType {
@@ -73,28 +84,23 @@ func (sink *openfalconSink) ExportData(dataBatch *core.DataBatch) {
 			} else {
 				continue
 			}
-
 			ft := falconType{
 				Metric:      metricName,
 				Endpoint:    endpoint,
 				Timestamp:   metricSet.ScrapeTime.UTC().Unix(),
-				Step:        5,
+				Step:        10,
 				Value:       value,
 				CounterType: "GAUGE",
-				Tags:        "cluster=,label=",
+				Tags:        "",
 			}
-			glog.V(4).Infof("raw metricValues：%s", ft)
 			fts = append(fts, ft)
-			glog.Infof("fts :%v", fts)
-			glog.Infof("start send ......................")
 			if len(fts) >= maxSendBatchSize {
-				//推送
 				sink.concurrentSendData(fts)
 				//清空fts
 				fts = make([]falconType, 0, 0)
 			}
 		}
-		//处理labelMetric
+		//处理labeledMetric
 		for _, labeledMetric := range metricSet.LabeledMetrics {
 			var value float64
 			if core.ValueInt64 == labeledMetric.ValueType {
@@ -104,24 +110,15 @@ func (sink *openfalconSink) ExportData(dataBatch *core.DataBatch) {
 			} else {
 				continue
 			}
-
 			ft := falconType{
 				Endpoint:    endpoint,
 				Metric:      labeledMetric.Name,
 				Timestamp:   metricSet.ScrapeTime.UTC().Unix(),
-				Step:        5,
+				Step:        10,
 				Value:       value,
 				CounterType: "GAUGE",
-				Tags:        "cluster=,label=",
+				Tags:        labeledMetric.Labels["resource_id"],
 			}
-			glog.V(4).Infof("raw labelMetric falconType:%v", ft)
-			//{k8s-node-1 disk/io_write_bytes 1521779865 5 0 GAUGE cluster=,label=}
-			//{k8s-node-1 disk/io_read_bytes_rate 1521779865 5 0 GAUGE cluster=,label=}
-			for key, value := range labeledMetric.Labels {
-				glog.V(4).Infof("[labeledMetric]   labeledMetric.Labels  key:%v  value :%v", key, value)
-				//labeledMetric.Labels  key:resource_id  value :253:0
-			}
-			glog.V(4).Infof("[labeledMetric]  start send labelMetric ..........")
 			fts = append(fts, ft)
 			if len(fts) >= maxSendBatchSize {
 				sink.concurrentSendData(fts)
@@ -136,11 +133,10 @@ func (sink *openfalconSink) ExportData(dataBatch *core.DataBatch) {
 	sink.wg.Wait()
 }
 
-//同步发送数据
+//并发发送数据
 func (sink *openfalconSink) concurrentSendData(fts []falconType) {
-	glog.V(4).Infof("start concurrentsend .................")
 	sink.wg.Add(1)
-	// 带缓存的channel，当达到最大的并发请求的时候阻塞
+	//带缓存的channel，当达到最大的并发请求的时候阻塞
 	//将匿名孔结构体放入channel中
 	sink.conChan <- struct{}{}
 	go func(fts []falconType) {
@@ -150,27 +146,26 @@ func (sink *openfalconSink) concurrentSendData(fts []falconType) {
 
 //发送数据
 func (sink *openfalconSink) sendData(fts []falconType) {
-	glog.V(4).Infof("start send final ....................")
 	defer func() {
 		// empty an item from the channel so the next waiting request can run
 		<-sink.conChan
 		sink.wg.Done()
 	}()
 
-	//falconType转换成json
 	falconJson, err := json.Marshal(fts)
 	if err != nil {
 		glog.V(2).Infof("Error: %v ,fail to marshal event to falcon type", err)
 		return
 	}
 
-	glog.V(3).Infof("push json info %s", falconJson)
-	/*if resp, err := http.Post("url", "application/json", bytes.NewReader(falconJson)); err != nil {
-		defer resp.Body.Close()
-		s, _ := ioutil.ReadAll(resp.Body)
-		glog.V(2).Infof("Error: %v ,fail to send %s to falcon ,err %s", s, err)
-		return
-	}*/
+	glog.V(4).Infof("push json info %s", falconJson)
+	resp, err := http.Post(sink.host, "application/json", bytes.NewReader(falconJson))
+	if err != nil {
+		glog.V(2).Infof("Error: %v ,fail to send %s to falcon ,err %s", string(falconJson[:]), err)
+	}
+	defer resp.Body.Close()
+	s, _ := ioutil.ReadAll(resp.Body)
+	glog.V(4).Infof("openfalcon response body :%s", s)
 	start := time.Now()
 	end := time.Now()
 	glog.V(4).Infof("Exported %d data to falcon in %s", len(fts), end.Sub(start))
@@ -182,7 +177,7 @@ func (sink *openfalconSink) Stop() {
 func CreateFalconSink(uri *url.URL) (core.DataSink, error) {
 	//返回falconSink对象,封装uri参数，falcon上报的地址
 	sink := &openfalconSink{
-		host: uri.Host,
+		host: uri.Scheme + "://" + uri.Host + uri.Path,
 		//设置最大的并发请求量
 		conChan: make(chan struct{}, 10),
 	}
