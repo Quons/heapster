@@ -53,26 +53,14 @@ func (sink *openfalconSink) ExportData(dataBatch *core.DataBatch) {
 	defer sink.Unlock()
 	var endpoint string
 	fts := make([]falconType, 0, 0)
-	for _, metricSet := range dataBatch.MetricSets {
+	for metricSetName, metricSet := range dataBatch.MetricSets {
 		//这里可以添加过滤
 		labelType := metricSet.Labels["type"]
 		switch labelType {
 		case "sys_container":
-			endpoint = metricSet.Labels["container_name"]
-		case "node":
-			endpoint = metricSet.Labels["nodename"]
-		case "cluster":
-			endpoint = "k8s-cluster"
-		case "ns":
-			endpoint = metricSet.Labels["namespace_name"]
-		case "pod":
-			endpoint = metricSet.Labels["pod_name"]
-		case "pod_container":
-			endpoint = metricSet.Labels["pod_name"]
+			continue
 		default:
-			endpoint = "another_type"
-			defaultJson, _ := json.Marshal(metricSet.Labels)
-			glog.V(3).Infof("another type :%s", string(defaultJson[:]))
+			endpoint = metricSetName
 		}
 		for metricName, metricValue := range metricSet.MetricValues {
 			//转换数据类型，都变成float64
@@ -111,7 +99,7 @@ func (sink *openfalconSink) ExportData(dataBatch *core.DataBatch) {
 				continue
 			}
 			ft := falconType{
-				Endpoint:    endpoint,
+				Endpoint:    metricSetName,
 				Metric:      labeledMetric.Name,
 				Timestamp:   metricSet.ScrapeTime.UTC().Unix(),
 				Step:        10,

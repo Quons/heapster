@@ -63,7 +63,6 @@ func (this *SinkFactory) Build(uri flags.Uri) (core.DataSink, error) {
 	case "librato":
 		return librato.CreateLibratoSink(&uri.Val)
 	case "log":
-		glog.Infof("log start")
 		return logsink.NewLogSink(), nil
 	case "metric":
 		return metricsink.NewMetricSink(140*time.Second, 15*time.Minute, []string{
